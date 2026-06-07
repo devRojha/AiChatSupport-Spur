@@ -11,10 +11,10 @@ datasource db {
   provider = "postgresql"
 }
 
-
 model Conversation {
   id        String    @id @default(uuid())
   createdAt DateTime  @default(now())
+  title     String?   
   messages  Message[]
 }
 
