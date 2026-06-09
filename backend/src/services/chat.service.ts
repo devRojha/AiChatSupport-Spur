@@ -1,70 +1,70 @@
-import { prisma } from "../db/prisma.js";
 import { generateReply, generateTitle } from "./llm.service.js";
+import redis from "../db/redis.js";
+import { CONVERSATIONS_CACHE_KEY, CONVERSATIONS_TTL, SESSION_TTL_MS } from "../utils/constants.js";
+import {
+    findConversationById,
+    createConversation,
+    updateConversationTitle,
+    findRecentConversations,
+    createMessage,
+    findMessagesPaginated,
+} from "../repositories/chat.repository.js";
 
-// --- Internal DB Helpers ---
+export class SessionExpiredError extends Error {
+    constructor() {
+        super("Session has expired");
+        this.name = "SessionExpiredError";
+    }
+}
 
-// UPDATED: Now checks how many messages exist in the conversation
 const getOrCreateConversation = async (sessionId?: string) => {
     if (sessionId) {
-        const existing = await prisma.conversation.findUnique({ 
-            where: { id: sessionId },
-            include: { _count: { select: { messages: true } } } // Count existing messages
-        });
+        const existing = await findConversationById(sessionId);
         if (existing) return existing;
     }
-    // If creating a new one, we know it has 0 messages
-    const newConv = await prisma.conversation.create({ data: {} });
+    const newConv = await createConversation();
+    redis.del(CONVERSATIONS_CACHE_KEY).catch(() => {});
     return { ...newConv, _count: { messages: 0 } };
 };
 
-const saveMessage = async (conversationId: string, text: string, sender: "user" | "ai") => {
-    return prisma.message.create({ data: { conversationId, text, sender } });
-};
-
-// --- Exported Business Logic ---
-
 export const getConversationHistory = async (conversationId: string, page: number = 1, limit: number = 10) => {
-    const skip = (page - 1) * limit;
-    const messages = await prisma.message.findMany({
-        where: { conversationId },
-        orderBy: { timestamp: 'desc' },
-        skip,
-        take: limit,
-    });
-    return messages.reverse();
+    return findMessagesPaginated(conversationId, (page - 1) * limit, limit);
 };
 
 export const getAllConversations = async () => {
-    return prisma.conversation.findMany({
-        orderBy: { createdAt: 'desc' },
-        take: 20,
-    });
+    try {
+        const cached = await redis.get(CONVERSATIONS_CACHE_KEY);
+        if (cached) return JSON.parse(cached);
+    } catch {}
+
+    const conversations = await findRecentConversations();
+
+    try {
+        await redis.set(CONVERSATIONS_CACHE_KEY, JSON.stringify(conversations), { EX: CONVERSATIONS_TTL });
+    } catch {}
+
+    return conversations;
 };
 
 export const processChatMessage = async (query: string, sessionId?: string) => {
-    // 1. Session Management
     const conversation = await getOrCreateConversation(sessionId);
     const currentSessionId = conversation.id;
 
-    // 2. Persist User Message
-    const safeMessage = query.substring(0, 1000);
-    await saveMessage(currentSessionId, safeMessage, "user");
-
-    // --- NEW: Background Title Generation ---
-    // If this is the very first message, generate a title in the background
-    if (conversation._count.messages === 0) {
-        generateTitle(safeMessage).then(async (title) => {
-            await prisma.conversation.update({
-                where: { id: currentSessionId },
-                data: { title: title }
-            });
-        }).catch(console.error); // Fire and forget!
+    if (sessionId && Date.now() - conversation.createdAt.getTime() > SESSION_TTL_MS) {
+        throw new SessionExpiredError();
     }
 
-    // 3. Fetch Context
+    const safeMessage = query.substring(0, 1000);
+    await createMessage(currentSessionId, safeMessage, "user");
+
+    if (conversation._count.messages === 0) {
+        generateTitle(safeMessage)
+            .then((title) => updateConversationTitle(currentSessionId, title))
+            .catch(console.error);
+    }
+
     const history = await getConversationHistory(currentSessionId, 1, 10);
 
-    // 4. Generate AI Reply
     let aiReplyText = "";
     try {
         aiReplyText = await generateReply(history, safeMessage);
@@ -72,12 +72,7 @@ export const processChatMessage = async (query: string, sessionId?: string) => {
         aiReplyText = error.message;
     }
 
-    // 5. Persist AI Message
-    await saveMessage(currentSessionId, aiReplyText, "ai");
+    await createMessage(currentSessionId, aiReplyText, "ai");
 
-    // 6. Return the finalized data
-    return {
-        reply: aiReplyText,
-        sessionId: currentSessionId,
-    };
+    return { reply: aiReplyText, sessionId: currentSessionId };
 };

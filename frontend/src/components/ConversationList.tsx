@@ -1,12 +1,8 @@
 import { useEffect, useState } from 'react';
-import { MessageSquare, Plus, ChevronRight, Loader } from 'lucide-react';
+import { MessageSquare, Plus, ChevronRight } from 'lucide-react';
 import { fetchConversations } from '../api/chat';
 import type { Conversation } from '../types';
-
-interface Props {
-  onNewChat: () => void;
-  onSelectConversation: (id: string, title: string) => void;
-}
+import { useChatContext } from '../context/ChatContext';
 
 function formatDate(iso: string): string {
   const date = new Date(iso);
@@ -18,7 +14,8 @@ function formatDate(iso: string): string {
   return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-export default function ConversationList({ onNewChat, onSelectConversation }: Props) {
+export default function ConversationList() {
+  const { dispatch } = useChatContext();
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -31,7 +28,7 @@ export default function ConversationList({ onNewChat, onSelectConversation }: Pr
 
   return (
     <div className="conv-list">
-      <button className="conv-list__new" onClick={onNewChat}>
+      <button className="conv-list__new" onClick={() => dispatch({ type: 'NEW_CHAT' })}>
         <Plus size={16} />
         New Conversation
       </button>
@@ -56,10 +53,10 @@ export default function ConversationList({ onNewChat, onSelectConversation }: Pr
               <div
                 key={conv.id}
                 className="conv-item"
-                onClick={() => onSelectConversation(conv.id, conv.title ?? 'Chat')}
+                onClick={() => dispatch({ type: 'OPEN_CONVERSATION', id: conv.id, title: conv.title ?? 'Chat', createdAt: conv.createdAt })}
                 role="button"
                 tabIndex={0}
-                onKeyDown={(e) => e.key === 'Enter' && onSelectConversation(conv.id, conv.title ?? 'Chat')}
+                onKeyDown={(e) => e.key === 'Enter' && dispatch({ type: 'OPEN_CONVERSATION', id: conv.id, title: conv.title ?? 'Chat', createdAt: conv.createdAt })}
               >
                 <div className="conv-item__icon">
                   <MessageSquare size={16} />

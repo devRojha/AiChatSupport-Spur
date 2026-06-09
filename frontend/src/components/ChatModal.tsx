@@ -1,48 +1,22 @@
-import { useState } from 'react';
 import { Bot, X, ArrowLeft } from 'lucide-react';
+import { ChatProvider, useChatContext } from '../context/ChatContext';
 import ConversationList from './ConversationList';
 import ChatView from './ChatView';
-
-type View = 'list' | 'chat';
 
 interface Props {
   isOpen: boolean;
   onClose: () => void;
 }
 
-export default function ChatModal({ isOpen, onClose }: Props) {
-  const [view, setView] = useState<View>('list');
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [title, setTitle] = useState('Support Chat');
-
-  const openNewChat = () => {
-    setSessionId(null);
-    setTitle('New Conversation');
-    setView('chat');
-  };
-
-  const openConversation = (id: string, convTitle: string) => {
-    setSessionId(id);
-    setTitle(convTitle);
-    setView('chat');
-  };
-
-  const handleBack = () => {
-    setView('list');
-    setSessionId(null);
-    setTitle('Support Chat');
-  };
-
-  const handleSessionCreated = (id: string, firstMsg: string) => {
-    setSessionId(id);
-    setTitle(firstMsg || 'New Chat');
-  };
+function ChatInner({ onClose }: { onClose: () => void }) {
+  const { state, dispatch } = useChatContext();
+  const { view, title } = state;
 
   return (
-    <div className={`modal ${isOpen ? 'open' : ''}`} role="dialog" aria-modal="true" aria-label="Support chat">
+    <>
       <div className="modal-header">
         {view === 'chat' ? (
-          <button className="modal-header__back" onClick={handleBack} aria-label="Back to conversations">
+          <button className="modal-header__back" onClick={() => dispatch({ type: 'BACK' })} aria-label="Back to conversations">
             <ArrowLeft size={15} />
           </button>
         ) : (
@@ -63,17 +37,17 @@ export default function ChatModal({ isOpen, onClose }: Props) {
         </button>
       </div>
 
-      {view === 'list' ? (
-        <ConversationList
-          onNewChat={openNewChat}
-          onSelectConversation={openConversation}
-        />
-      ) : (
-        <ChatView
-          sessionId={sessionId}
-          onSessionCreated={handleSessionCreated}
-        />
-      )}
+      {view === 'list' ? <ConversationList /> : <ChatView />}
+    </>
+  );
+}
+
+export default function ChatModal({ isOpen, onClose }: Props) {
+  return (
+    <div className={`modal ${isOpen ? 'open' : ''}`} role="dialog" aria-modal="true" aria-label="Support chat">
+      <ChatProvider>
+        <ChatInner onClose={onClose} />
+      </ChatProvider>
     </div>
   );
 }
