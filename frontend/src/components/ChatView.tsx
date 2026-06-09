@@ -1,18 +1,18 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { Send, ChevronUp } from 'lucide-react';
 import { fetchMessages, sendMessage } from '../api/chat';
 import type { Message } from '../types';
-
-interface Props {
-  sessionId: string | null;
-  onSessionCreated: (id: string, title: string) => void;
-}
+import { SESSION_TTL_MS } from '../constants';
+import { useChatContext } from '../context/ChatContext';
 
 function formatTime(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-export default function ChatView({ sessionId, onSessionCreated }: Props) {
+export default function ChatView() {
+  const { state, dispatch } = useChatContext();
+  const { sessionId, createdAt } = state;
+
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -22,9 +22,16 @@ export default function ChatView({ sessionId, onSessionCreated }: Props) {
   const [hasMore, setHasMore] = useState(true);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(sessionId);
 
+  const isExpired = useMemo(
+    () => (createdAt ? Date.now() - new Date(createdAt).getTime() > SESSION_TTL_MS : false),
+    [createdAt],
+  );
+
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Prevents the auto-scroll effect from firing after a "load more" prepend
+  const skipNextScrollRef = useRef(false);
 
   const scrollToBottom = () => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -44,31 +51,45 @@ export default function ChatView({ sessionId, onSessionCreated }: Props) {
   }, []);
 
   useEffect(() => {
+    setCurrentSessionId(sessionId);
+    setMessages([]);
+    setPage(1);
+    setHasMore(true);
     if (sessionId) {
-      setCurrentSessionId(sessionId);
       loadMessages(sessionId, 1, false);
     }
   }, [sessionId, loadMessages]);
 
+  // Only scroll to bottom for new messages / initial load, not for "load more" prepends
   useEffect(() => {
-    if (!fetching) scrollToBottom();
-  }, [messages]);
+    if (!fetching) {
+      if (skipNextScrollRef.current) {
+        skipNextScrollRef.current = false;
+        return;
+      }
+      scrollToBottom();
+    }
+  }, [messages, fetching]);
 
   const handleLoadMore = async () => {
     if (!currentSessionId || fetching || !hasMore) return;
+    // Tell the scroll effect to skip this messages update
+    skipNextScrollRef.current = true;
     const prevScrollHeight = scrollRef.current?.scrollHeight ?? 0;
     const nextPage = page + 1;
     setPage(nextPage);
     await loadMessages(currentSessionId, nextPage, true);
-    // restore scroll position after prepend
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight - prevScrollHeight;
-    }
+    // Restore scroll position AFTER React has committed the new DOM
+    requestAnimationFrame(() => {
+      if (scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight - prevScrollHeight;
+      }
+    });
   };
 
   const handleSend = async () => {
     const text = input.trim();
-    if (!text || loading) return;
+    if (!text || loading || isExpired) return;
 
     const now = new Date().toISOString();
     const optimisticUser: Message = {
@@ -89,7 +110,7 @@ export default function ChatView({ sessionId, onSessionCreated }: Props) {
 
       if (!currentSessionId) {
         setCurrentSessionId(res.sessionId);
-        onSessionCreated(res.sessionId, text.slice(0, 40));
+        dispatch({ type: 'SESSION_CREATED', title: text.slice(0, 40) });
       }
 
       const aiMsg: Message = {
@@ -100,10 +121,13 @@ export default function ChatView({ sessionId, onSessionCreated }: Props) {
       };
 
       setMessages((prev) => [...prev, aiMsg]);
-    } catch {
+    } catch (err) {
+      const isExpiredErr = err instanceof Error && err.message === 'SESSION_EXPIRED';
       const errMsg: Message = {
         id: `err-${Date.now()}`,
-        content: 'Something went wrong. Please try again.',
+        content: isExpiredErr
+          ? 'This conversation has expired. Please start a new chat.'
+          : 'Something went wrong. Please try again.',
         sender: 'ai',
         timestamp: new Date().toISOString(),
       };
@@ -162,21 +186,28 @@ export default function ChatView({ sessionId, onSessionCreated }: Props) {
         <div ref={bottomRef} />
       </div>
 
+      {isExpired && (
+        <div className="session-expired-banner">
+          This conversation has expired. Please start a new chat.
+        </div>
+      )}
+
       <div className="chat-input">
         <textarea
           ref={textareaRef}
           className="chat-input__field"
-          placeholder="Type a message..."
+          placeholder={isExpired ? 'Session expired' : 'Type a message...'}
           value={input}
           onChange={handleInputChange}
           onKeyDown={handleKeyDown}
           rows={1}
+          disabled={isExpired}
           aria-label="Message input"
         />
         <button
           className="chat-input__send"
           onClick={handleSend}
-          disabled={!input.trim() || loading}
+          disabled={!input.trim() || loading || isExpired}
           aria-label="Send message"
         >
           <Send size={16} />

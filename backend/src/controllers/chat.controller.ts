@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import { QuerySchema } from "../types/zodSchema.js"; 
-import { getConversationHistory, processChatMessage, getAllConversations } from "../services/chat.service.js";
+import { getConversationHistory, processChatMessage, getAllConversations, SessionExpiredError } from "../services/chat.service.js";
 
 export const handleIncomingMessage = async (req: Request, res: Response): Promise<void> => {
     try {
@@ -26,6 +26,10 @@ export const handleIncomingMessage = async (req: Request, res: Response): Promis
         res.json(result);
 
     } catch (error) {
+        if (error instanceof SessionExpiredError) {
+            res.status(410).json({ error: "SESSION_EXPIRED", message: "This conversation has expired. Please start a new chat." });
+            return;
+        }
         console.error("Controller Error:", error);
         res.status(500).json({ error: "Internal server error" });
     }

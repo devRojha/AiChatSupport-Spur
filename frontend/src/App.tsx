@@ -32,26 +32,13 @@ export default function App() {
         <p className="landing__hint">Usually replies in seconds</p>
 
         {/* Feature pills */}
-        <div style={{ display: 'flex', gap: 12, marginTop: '3rem', flexWrap: 'wrap', justifyContent: 'center' }}>
+        <div className="landing__pills">
           {[
             { icon: <Zap size={14} />, label: 'Instant replies' },
             { icon: <Shield size={14} />, label: 'Secure & private' },
             { icon: <Clock size={14} />, label: '24/7 support' },
           ].map(({ icon, label }) => (
-            <div
-              key={label}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 6,
-                fontSize: 13,
-                color: 'var(--color-muted-text)',
-                background: 'var(--color-muted)',
-                border: '1px solid var(--color-border)',
-                padding: '6px 12px',
-                borderRadius: 100,
-              }}
-            >
+            <div key={label} className="landing__pill">
               {icon}
               {label}
             </div>
