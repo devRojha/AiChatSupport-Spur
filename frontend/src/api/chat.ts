@@ -1,6 +1,5 @@
 import type { Conversation, Message } from '../types';
-
-const BASE = 'http://localhost:3000/api/v1/chat';
+import { API_BASE as BASE } from '../constants';
 
 export async function fetchConversations(): Promise<Conversation[]> {
   const res = await fetch(`${BASE}/conversations`);
@@ -25,6 +24,7 @@ export async function sendMessage(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, ...(sessionId ? { sessionId } : {}) }),
   });
+  if (res.status === 410) throw new Error('SESSION_EXPIRED');
   if (!res.ok) throw new Error('Failed to send message');
   return res.json();
 }

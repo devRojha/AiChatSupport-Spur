@@ -116,6 +116,26 @@ body {
   color: var(--color-muted-text);
 }
 
+.landing__pills {
+  display: flex;
+  gap: 12px;
+  margin-top: 3rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.landing__pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--color-muted-text);
+  background: var(--color-muted);
+  border: 1px solid var(--color-border);
+  padding: 6px 12px;
+  border-radius: 100px;
+}
+
 /* ── Widget Button ── */
 .widget-btn {
   position: fixed;
@@ -134,7 +154,6 @@ body {
   box-shadow: 0 4px 20px rgba(37, 99, 235, 0.45);
   transition: transform 200ms cubic-bezier(0.34, 1.56, 0.64, 1), background 150ms ease;
   z-index: 1000;
-  aria-label: "Open support chat";
 }
 
 .widget-btn:hover {
@@ -530,6 +549,18 @@ body {
 
 .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
 .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+
+/* ── Session Expired Banner ── */
+.session-expired-banner {
+  margin: 0 12px 8px;
+  padding: 8px 12px;
+  background: #fff3cd;
+  border: 1px solid #ffc107;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #856404;
+  text-align: center;
+}
 
 /* ── Chat Input ── */
 .chat-input {

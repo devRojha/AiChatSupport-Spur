@@ -59,6 +59,7 @@ npm install
 DATABASE_URL="postgresql://<user>:<password>@localhost:5432/aidb"
 PORT=3000
 HUGGINGFACEHUB_API_KEY="hf_your_key_here"
+REDIS_URL="redis://localhost:6379"
 ```
 
 > Get your HuggingFace token at: https://huggingface.co/settings/tokens
@@ -71,6 +72,12 @@ npx prisma migrate dev
 ```
 
 This creates the `Conversation` and `Message` tables.
+
+**Start Redis** (requires Docker):
+
+```bash
+docker run -d --name redis -p 6379:6379 redis:alpine
+```
 
 **Start the backend:**
 
@@ -114,6 +121,7 @@ Send a user message and receive an AI reply.
 
 - Omit `sessionId` on first message — the backend creates a new session and returns its ID.
 - Messages are capped at 1000 characters server-side.
+- Returns `410 Gone` with `{ "error": "SESSION_EXPIRED" }` if the session is older than 2 hours.
 
 ---
 
@@ -136,35 +144,54 @@ Returns paginated messages for a session, newest page first. Each page is return
 
 ```
 backend/src/
-├── index.ts               # Express app bootstrap, middleware, health check
+├── index.ts                    # Express app bootstrap, middleware, health check
 ├── routes/
-│   ├── index.ts           # Root router — mounts feature routers
-│   └── chat.routes.ts     # Chat endpoints (GET conversations, GET messages, POST message)
+│   ├── index.ts                # Root router — mounts feature routers
+│   └── chat.routes.ts          # Chat endpoints (GET conversations, GET messages, POST message)
 ├── controllers/
-│   └── chat.controller.ts # HTTP layer — validates input with Zod, delegates to service
+│   └── chat.controller.ts      # HTTP layer — Zod validation, delegates to service, maps errors to status codes
 ├── services/
-│   ├── chat.service.ts    # Business logic — session management, DB writes, LLM orchestration
-│   └── llm.service.ts     # LLM abstraction — generateReply(), generateTitle()
+│   ├── chat.service.ts         # Business logic — session management, expiry check, LLM orchestration
+│   └── llm.service.ts          # LLM abstraction — generateReply(), generateTitle() with Redis caching
+├── repositories/
+│   └── chat.repository.ts      # All Prisma/DB calls — find, create, update conversations & messages
 ├── db/
-│   └── prisma.ts          # Singleton Prisma client
+│   ├── prisma.ts               # Singleton Prisma client
+│   └── redis.ts                # Redis client (createClient, auto-connect, error logging)
 ├── utils/
-│   └── prompt.ts          # System prompt + title prompt templates
+│   ├── constants.ts            # Shared constants — TTLs, cache keys, session expiry duration
+│   ├── cache.ts                # Shared Redis helpers — redisGet(), redisSet(), normalise()
+│   └── prompt.ts               # System prompt + title prompt templates
+├── middleware/                 # Express middleware (cors, json, etc.)
 └── types/
-    └── zodSchema.ts       # Zod schemas for request validation
+    └── zodSchema.ts            # Zod schemas for request validation
 ```
 
 ### Request lifecycle (POST /chat/message)
 
 ```
-Frontend → Controller (Zod validation)
-         → chat.service: getOrCreateConversation()
-         → chat.service: saveMessage("user")
-         → chat.service: getConversationHistory() [last 10 msgs as context]
-         → llm.service: generateReply(history, userMessage)
-              → HuggingFace chatCompletion API (Qwen2.5-7B)
-         → chat.service: saveMessage("ai")
-         → Response { reply, sessionId }
-         [background] generateTitle() → update conversation title
+Frontend
+  → Controller        Zod validation; catches SessionExpiredError → 410
+  → chat.service      getOrCreateConversation()
+      → chat.repository   findConversationById() or createConversation()
+  → chat.service      session age check  (createdAt + 2h < now → throw SessionExpiredError)
+  → chat.service      createMessage("user")
+      → chat.repository   createMessage()
+  → chat.service      getConversationHistory()  [last 10 msgs as LLM context]
+      → chat.repository   findMessagesPaginated()
+  → llm.service       generateReply(history, userMessage)
+      → utils/cache       redisGet()  [cache check — first messages only]
+      → HuggingFace       chatCompletion API (Qwen/Qwen2.5-7B-Instruct via Together)
+      → utils/cache       redisSet()  [cache write, 1h TTL]
+  → chat.service      createMessage("ai")
+      → chat.repository   createMessage()
+  → Response          { reply, sessionId }
+
+  [background — non-blocking]
+  → llm.service       generateTitle(userMessage)
+      → utils/cache       redisGet() / redisSet()  [24h TTL]
+      → HuggingFace       chatCompletion API
+      → chat.repository   updateConversationTitle()
 ```
 
 ### Data Model
@@ -193,6 +220,62 @@ Message
 
 **Prompt-based knowledge** — Store FAQs are hardcoded in `prompt.ts`. This is intentional for simplicity; the architecture makes it trivial to swap to DB-driven knowledge later (see Enhancements).
 
+**Session expiry (2-hour TTL)** — Sessions older than 2 hours are treated as expired. The check happens at two layers:
+- *Backend*: `processChatMessage` computes `Date.now() - conversation.createdAt > 2h` and throws `SessionExpiredError`, which the controller catches and returns as HTTP `410 Gone` with `{ error: "SESSION_EXPIRED" }`. Using 410 (rather than 403/401) signals that the resource existed but is permanently gone.
+- *Frontend*: `ChatView` computes `isExpired` from the `createdAt` timestamp passed down through `ChatModal → ConversationList`. The send button and textarea are disabled immediately on render — the user can't even attempt to send without a round-trip. A yellow warning banner is shown above the input area.
+
+This dual-layer approach means even a client that bypasses the UI (e.g. cURL) is rejected at the API boundary.
+
+---
+
+## Caching (Redis)
+
+The biggest performance bottleneck in this app is the LLM call — it takes 3–8 seconds on the free HuggingFace tier. Redis is used to eliminate that wait for repeated questions and to reduce unnecessary DB queries.
+
+### What's cached
+
+| Layer | Cache key | TTL | Why |
+|---|---|---|---|
+| LLM reply | `llm:reply:<normalised message>` | 1 hour | FAQ answers are stable — "return policy" always returns the same answer |
+| Conversation title | `llm:title:<normalised message>` | 24 hours | Titles are generated once and never change |
+| Conversations list | `conversations:list` | 30 seconds | Fetched every time the modal opens; changes infrequently |
+
+### Why these specific choices
+
+**LLM reply cache (biggest win)**
+The LLM call is the only genuinely slow operation in the request lifecycle (~3–8s). Users frequently ask the same FAQ questions — "what's your return policy?", "do you ship to the USA?" — and the answer is always identical. Caching the reply for 1 hour means the second user to ask the same question gets an instant response instead of waiting for the LLM.
+
+The cache key is derived from the **normalised** message text — lowercased, punctuation stripped, whitespace collapsed. This means `"What's your return policy?"` and `"what is return policy"` resolve to the same cache entry, maximising hit rate across slightly different phrasings.
+
+**Only first messages are cached**
+Follow-up messages in a conversation depend on the conversation history as context, so the same question can legitimately produce a different answer mid-conversation. Only first messages (no prior history) are cached — these are pure FAQ queries where context doesn't change the answer.
+
+**Conversations list cache (reduce DB load)**
+The list is fetched on every modal open. At moderate traffic, this is a wasteful repeated DB query — the list rarely changes. A 30-second TTL is short enough that a new conversation appears within half a minute without the user needing to refresh.
+
+The cache is **explicitly invalidated** (not just expired) when a new conversation is created, so the list updates immediately after a new chat is started.
+
+**Title cache (eliminate duplicate LLM calls)**
+The title generation is a background LLM call. If two users start conversations with the same first message (common for FAQ entries), without caching this fires two identical LLM requests. The 24-hour TTL reflects that titles, once generated, never need to change.
+
+### Fault tolerance
+
+Redis failures are fully transparent — all cache operations are wrapped in `try/catch`. If Redis is down:
+- Cache reads return `null` → code falls through to the LLM or DB
+- Cache writes are skipped silently
+
+The app works correctly without Redis; it just loses the performance benefit.
+
+### Redis setup
+
+```bash
+# Docker (recommended)
+docker run -d --name redis -p 6379:6379 redis:alpine
+
+# Verify
+docker exec -it redis redis-cli ping  # → PONG
+```
+
 ---
 
 ## LLM Notes
@@ -203,7 +286,7 @@ Message
 **Prompting approach:**
 - A single user message is sent containing the full system context (store knowledge + conversation history + current user message).
 - History is formatted as `User: ... / Assistant: ...` plain text and injected into the prompt template.
-- The last 10 messages are included as context (configurable in `chat.service.ts`).
+- The last 10 messages are included as context (configurable in `chat.service.ts` → `getConversationHistory` call).
 - `max_tokens: 250`, `temperature: 0.2` — keeps replies short and factual.
 
 **Out-of-scope guardrail:**
@@ -218,7 +301,7 @@ The system prompt explicitly instructs the model to respond with a fixed refusal
 ## Current Bottlenecks
 
 **1. LLM latency (~3–8 seconds per reply)**
-The free HuggingFace Together inference endpoint is slow and occasionally rate-limited. Every message is a blocking HTTP call — the user sees a typing indicator but must wait for the full response before seeing anything.
+The free HuggingFace Together inference endpoint is slow and occasionally rate-limited. Redis caching eliminates this for repeated FAQ questions (cache hit = instant response), but the first user to ask any given question still waits the full duration. Follow-up messages within a conversation are never cached and always pay the full LLM cost.
 
 **2. No streaming**
 The entire reply is returned in one HTTP response. For longer answers, this creates a perceived dead period. Streaming (SSE or WebSockets) would make replies feel instant.
@@ -238,9 +321,9 @@ The last 10 messages are always fetched regardless of their length. Very long me
 
 **Short-term:**
 - [ ] **Streaming replies** — Switch to SSE (`chatCompletionStream`) so words appear as the model generates them, eliminating the perceived wait.
-- [ ] **Redis caching** — Cache frequent FAQ answers (e.g. "return policy") with a short TTL to skip LLM calls entirely for repeat questions.
 - [ ] **Rate limiting** — Add `express-rate-limit` on the POST endpoint to prevent abuse.
 - [ ] **Input sanitisation** — Strip HTML/script tags from user input before persisting.
+- [ ] **Cache follow-up messages** — Extend Redis caching to in-conversation messages using a hash of (sessionId + normalised message) as the key.
 
 **Medium-term:**
 - [ ] **DB-driven knowledge base** — Move store FAQs from the hardcoded prompt into a `KnowledgeEntry` table. Embed entries and do semantic search (pgvector) to inject only the most relevant context per query.
@@ -251,7 +334,6 @@ The last 10 messages are always fetched regardless of their length. Very long me
 **Architectural:**
 - [ ] **Swap LLM provider** — The `llm.service.ts` interface (`generateReply(history, message)`) is provider-agnostic. Switching to Claude or GPT-4o requires updating only this file and the env var.
 - [ ] **WebSocket transport** — Replace polling with a persistent WebSocket connection for real-time, bidirectional chat — the natural step before adding WhatsApp/Instagram channels.
-- [ ] **Multi-channel abstraction** — Add a `Channel` field to `Message` (`web` | `whatsapp` | `instagram`). The same `chat.service` logic works for any channel; only the transport layer changes.
 - [ ] **Auth** — Session tokens tied to a user ID rather than anonymous UUIDs, enabling cross-device history.
 
 ---
@@ -277,15 +359,36 @@ AiChatSupport-Spur/
 │   │   └── schema.prisma
 │   ├── src/
 │   │   ├── controllers/
+│   │   │   └── chat.controller.ts
 │   │   ├── services/
+│   │   │   ├── chat.service.ts
+│   │   │   └── llm.service.ts
+│   │   ├── repositories/
+│   │   │   └── chat.repository.ts
 │   │   ├── routes/
+│   │   │   ├── index.ts
+│   │   │   └── chat.routes.ts
 │   │   ├── db/
+│   │   │   ├── prisma.ts
+│   │   │   └── redis.ts
 │   │   ├── utils/
-│   │   └── types/
+│   │   │   ├── constants.ts
+│   │   │   ├── cache.ts
+│   │   │   └── prompt.ts
+│   │   ├── middleware/
+│   │   ├── types/
+│   │   │   └── zodSchema.ts
+│   │   └── index.ts
 │   └── .env              ← not committed
 └── frontend/
     └── src/
         ├── api/
+        │   └── chat.ts
         ├── components/
-        └── types.ts
+        │   ├── ChatModal.tsx
+        │   ├── ChatView.tsx
+        │   └── ConversationList.tsx
+        ├── types.ts
+        ├── App.tsx
+        └── main.tsx
 ```
